@@ -6,6 +6,7 @@ evaluation:
   result_dirs:
     - contrast_results
     # - ablation_results
+    - our_results
 
   # 需要评估的数据集列表
   datasets:
@@ -22,9 +23,9 @@ evaluation:
   # 需要评估的模型/方法列表（对应文件名，不含 .parquet 后缀）
   models:
     # - gpt_5.4_tk
-    - qwen3.5_2b_tk
+    # - qwen3.5_2b_tk
     # - claude_4.6_tk
-    # - deberta-v3-base
+    - deberta-v3-base
     # - gemma_31b_tk
     # - glm_5_tk
 

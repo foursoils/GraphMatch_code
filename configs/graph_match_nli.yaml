@@ -3,6 +3,17 @@ nli_graph:
     train_parquet: "../data/minicheck/data_with_graph/gemma_26b_tk/train.parquet"
     val_parquet: "../data/minicheck/data_with_graph/gemma_26b_tk/val.parquet"
     test_parquet: "../data/minicheck/data_with_graph/gemma_26b_tk/test.parquet"
+    data_root: "../data"
+    output_filename: "deberta-v3-base.parquet"
+    datasets:
+      - AggreFact-CNN
+      - AggreFact-XSum
+      - COVID-Fact
+      - ExpertQA
+      - SCIFACT
+      - minicheck
+      - pubhealth
+      - summeval
 
   model:
     # NLI 编码器（DeBERTa-v3-base，二分类 NLI 微调版）

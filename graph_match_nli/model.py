@@ -59,13 +59,16 @@ class GraphCrossAttentionLayer(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_size)
 
+        # Tanh Gating parameter initialized to 0
+        self.alpha_micro = nn.Parameter(torch.zeros(1))
+
     def forward(self, h_k: torch.Tensor,
                 node_emb: torch.Tensor,
                 node_batch: torch.Tensor) -> torch.Tensor:
         """
         h_k:        [B, seq_len, hidden_size]
         node_emb:   [total_nodes, node_hidden_dim]  （claim + doc 节点合并）
-        node_batch: [total_nodes]  节点归属的 batch index
+        node_batch: [total_nodes]  节点归属 of batch index
 
         返回: [B, seq_len, hidden_size]，已加残差 + LayerNorm
         """
@@ -121,8 +124,8 @@ class GraphCrossAttentionLayer(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, seq_len, self.hidden_size)
         out = self.out_proj(out)                              # [B, seq_len, hidden_size]
 
-        # 残差 + LayerNorm
-        return self.norm(h_k + out)
+        # Tanh Gating + 残差 + LayerNorm
+        return self.norm(h_k + torch.tanh(self.alpha_micro) * out)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -185,6 +188,9 @@ class NLIGraphClassifier(nn.Module):
         self.graph_global_proj = nn.Linear(node_hidden_dim, hidden_size)
         self.graph_global_norm = nn.LayerNorm(hidden_size)
 
+        # Tanh Gating parameter for macro-level injection initialized to 0
+        self.alpha_macro = nn.Parameter(torch.zeros(1))
+
         # ── 分类头（复用 NLI 预训练逻辑，2 类）──────────────────────────
         # DeBERTa NLI 模型的分类头结构: Linear(768, 2)
         # 这里重建，权重可从预训练模型加载
@@ -225,14 +231,19 @@ class NLIGraphClassifier(nn.Module):
         B = input_ids.size(0)
 
         # ── Step 1: GMN 处理图，获取节点级 + 图级嵌入 ───────────────────
-        node_c, node_d, graph_global, batch_c, batch_d = self.gmn(graph_batch)
+        node_c, node_d, _, batch_c, batch_d = self.gmn(graph_batch)
+
+        # 用 global_mean_pool 计算 claim 与 doc 图全局特征并做差值
+        g_c = global_mean_pool(node_c, batch_c, size=B)  # [B, node_hidden_dim]
+        g_d = global_mean_pool(node_d, batch_d, size=B)  # [B, node_hidden_dim]
+        delta_h_g = g_c - g_d                            # [B, node_hidden_dim]
 
         # 合并 claim + doc 节点，统一做 cross-attention
         node_all = torch.cat([node_c, node_d], dim=0)       # [N_c+N_d, node_hidden_dim]
         # batch index 偏移（两图节点 batch index 相同，直接 cat 即可）
         node_batch_all = torch.cat([batch_c, batch_d], dim=0)
 
-        # ── Step 2: 注册 forward hook，在第 k 层输出后注入图信息 ───────────
+        # ── Step 2: 注册 forward hook，在第 k 层 Attention 输出后注入图信息 ────────
         # 使用 hook 而非手动逐层调用，避免触碰 DeBERTa-v3 内部
         # rel_embeddings / query_states / attention_mask 格式等细节
         def _inject_hook(module, layer_input, layer_output):
@@ -242,19 +253,20 @@ class NLIGraphClassifier(nn.Module):
             is_tuple = isinstance(layer_output, tuple)
             h = layer_output[0] if is_tuple else layer_output   # [B, seq, 768]
 
-            # 3a. 节点级 Cross-Attention 注入 + 残差 + LayerNorm
+            # 3a. 节点级 Cross-Attention 注入 + 残差 + LayerNorm (已包含 Tanh Gating)
             h = self.cross_attn(h, node_all, node_batch_all)
 
-            # 3b. 图级全局向量注入 + 残差 + LayerNorm
-            # graph_global [B, node_hidden_dim] → [B, 1, hidden_size]
-            g_proj = self.graph_global_proj(graph_global).unsqueeze(1)
-            h = self.graph_global_norm(h + g_proj)
+            # 3b. 图级差异向量注入 + Tanh 门控 + 残差 + LayerNorm
+            # delta_h_g [B, node_hidden_dim] → [B, 1, hidden_size]
+            g_proj = self.graph_global_proj(delta_h_g).unsqueeze(1)
+            h = self.graph_global_norm(h + torch.tanh(self.alpha_macro) * g_proj)
 
             # 还原原始返回格式
             return (h,) + layer_output[1:] if is_tuple else h
 
-        target_layer = self.nli_encoder.encoder.layer[self.inject_layer_k - 1]
-        hook = target_layer.register_forward_hook(_inject_hook)
+        # 注册在 attention 子模块上，实现在 Self-Attention 之后，FFN 之前注入
+        target_submodule = self.nli_encoder.encoder.layer[self.inject_layer_k - 1].attention
+        hook = target_submodule.register_forward_hook(_inject_hook)
 
         # ── Step 3: DeBERTa 完整前向（内部自动处理 rel_embeddings 等）──────
         try:
