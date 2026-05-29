@@ -167,6 +167,30 @@ def train():
     # ---- GPU 与环境变量配置 ----
     gpu_ids = train_cfg.get('gpu_ids', None)
     if gpu_ids is not None and gpu_ids != "":
+        gpus = [x.strip() for x in str(gpu_ids).split(',') if x.strip()]
+        num_gpus = len(gpus)
+        if num_gpus > 1:
+            # 检查当前是否已经在分布式环境中运行（避免无限循环拉起）
+            is_distributed = any(k in os.environ for k in ["RANK", "LOCAL_RANK", "WORLD_SIZE"])
+            if not is_distributed:
+                print(f"\n[Self-Launcher] 检测到多卡配置 (gpu_ids: {gpu_ids})，正在自动通过 `accelerate launch` 启动多卡训练...")
+                # 先设置 CUDA_VISIBLE_DEVICES，让子进程继承它
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids)
+                
+                import subprocess
+                # 构造启动命令，使用当前 Python 解释器和脚本路径
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "accelerate.commands.launch",
+                    f"--num_processes={num_gpus}",
+                    sys.argv[0]
+                ] + sys.argv[1:]
+                
+                # 运行子进程并同步退出状态
+                result = subprocess.run(cmd)
+                sys.exit(result.returncode)
+        
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids)
 
     seed_everything(train_cfg.get('seed', 42))

@@ -60,15 +60,15 @@ llm_graph:
       - "down_proj"
 
   training:
-    # GPU：单卡请设为 "0"
-    gpu_ids: "0"
+    # GPU：单卡请设为 "0"，双卡请设为 "0,1"
+    gpu_ids: "0,1"
     # 混合精度，可选 "bf16", "fp16", "no"
     mixed_precision: "bf16"
     seed: 42
     num_epochs: 10
     batch_size: 1 # 每卡 batch；双卡时显存仍紧，暂保持 1
-    eval_batch_size: 4 # 单卡评估，降低以保显存安全，原 8->4
-    grad_accum_steps: 16 # 单卡：1×1×16=16 等效 batch（与原双卡 1×2×8=16 一致）
+    eval_batch_size: 4 # 每卡评估，降低以保显存安全，原 8->4
+    grad_accum_steps: 8 # 双卡：1×2×8=16 等效 batch（与原单卡 1×1×16=16 一致）
     num_workers: 8 # DataLoader 并行，约每卡 4 worker
     # 双学习率：LoRA + Cross-Attn/GNN 分开
     lora_lr: 2.0e-4
