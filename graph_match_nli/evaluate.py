@@ -153,7 +153,7 @@ def evaluate():
                 # dataset label 1=支持, 0=幻觉
                 probs = torch.softmax(logits, dim=-1)[:, 0]          # entailment(支持) 概率
                 preds = (logits[:, 0] > logits[:, 1]).long()         # 支持(1) vs 幻觉(0)
-                labels = batch.y.squeeze(-1).long()
+                labels = batch.y.view(-1).long()
 
                 all_preds.extend(preds.cpu().numpy().tolist())
                 all_probs.extend(probs.cpu().numpy().tolist())

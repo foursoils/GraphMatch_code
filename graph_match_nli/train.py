@@ -53,7 +53,7 @@ def evaluate(model, loader, device, criterion, use_amp=False):
             input_ids      = batch.input_ids
             attention_mask = batch.attention_mask
             token_type_ids = batch.token_type_ids
-            labels = batch.y.squeeze(-1).long()
+            labels = batch.y.view(-1).long()
 
             with autocast('cuda', enabled=use_amp):
                 logits = model(input_ids, attention_mask, token_type_ids, batch)
@@ -222,7 +222,7 @@ def train():
             input_ids      = batch.input_ids
             attention_mask = batch.attention_mask
             token_type_ids = batch.token_type_ids
-            labels         = batch.y.squeeze(-1).long()
+            labels         = batch.y.view(-1).long()
 
             with autocast('cuda', enabled=use_amp):
                 logits = model(input_ids, attention_mask, token_type_ids, batch)
