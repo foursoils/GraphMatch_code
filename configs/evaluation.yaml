@@ -25,10 +25,11 @@ evaluation:
     # - gpt_5.4_tk
     # - qwen3.5_2b_tk
     # - claude_4.6_tk
-    - deberta-v3-base
-    - deberta-v3-base-512
+    # - deberta-v3-base
+    # - deberta-v3-base-512
     # - gemma_31b_tk
     # - glm_5_tk
+    - qwen3_4b_instruct
 
   # 列名配置
   columns:
