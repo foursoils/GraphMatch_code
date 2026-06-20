@@ -197,6 +197,8 @@ def validate(model: LLMGraphModel, loader: DataLoader, device: torch.device, acc
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='configs/graph_match_llm.yaml')
+    parser.add_argument('--resume', action='store_true',
+                        help='从 output_dir/best_model.pt 断点续训（跳过已完成的 epoch）')
     args = parser.parse_args()
 
     config_path = os.path.join(_PROJ_ROOT, args.config) if not os.path.isabs(args.config) \
@@ -283,6 +285,7 @@ def train():
             train_embed_file=train_embed_file,
             val_embed_file=val_embed_file,
             grad_accum=grad_accum,
+            resume=args.resume,
         )
     finally:
         if accelerator.is_main_process:
@@ -301,6 +304,7 @@ def _run_training_loop(
     train_embed_file,
     val_embed_file,
     grad_accum,
+    resume=False,
 ):
     # ---- 模型初始化 ----
     accelerator.print("\n[1/4] 初始化模型...")
@@ -395,9 +399,52 @@ def _run_training_loop(
     )
 
     # 准备完数据加载器后，在多卡下它的长度会缩减，此时再算总步数更准确
-    num_epochs    = train_cfg.get('num_epochs', 5)
-    total_steps   = (len(train_loader) // grad_accum) * num_epochs
-    warmup_steps  = int(total_steps * train_cfg.get('warmup_ratio', 0.1))
+    num_epochs      = train_cfg.get('num_epochs', 5)
+    steps_per_epoch = len(train_loader) // grad_accum
+
+    # ---- 断点续训（可选）----
+    start_epoch = 1
+    best_bacc   = -1.0
+    no_improve  = 0
+
+    if resume:
+        best_ckpt_path = os.path.join(output_dir, 'best_model.pt')
+        if os.path.exists(best_ckpt_path):
+            accelerator.print(f"\n[Resume] 加载检查点: {best_ckpt_path}")
+            ckpt_data = torch.load(best_ckpt_path, map_location='cpu')
+            unwrapped = accelerator.unwrap_model(model)
+
+            unwrapped.gmn.load_state_dict(ckpt_data['gmn'])
+            unwrapped.projector.load_state_dict(ckpt_data['projector'])
+            unwrapped.cross_attn_layer.load_state_dict(ckpt_data['cross_attn'])
+            if 'gmn_delta_cls_head' in ckpt_data:
+                unwrapped.gmn_delta_cls_head.load_state_dict(ckpt_data['gmn_delta_cls_head'])
+            unwrapped.graph_global_proj.load_state_dict(ckpt_data['graph_global_proj'])
+            unwrapped.graph_global_norm.load_state_dict(ckpt_data['graph_global_norm'])
+            unwrapped.alpha_macro.data.copy_(ckpt_data['alpha_macro'])
+
+            lora_dir = os.path.join(output_dir, 'lora_adapter')
+            safetensors_fp = os.path.join(lora_dir, 'adapter_model.safetensors')
+            if os.path.exists(safetensors_fp):
+                import safetensors.torch as _st
+                from peft import set_peft_model_state_dict
+                adapter_w = _st.load_file(safetensors_fp)
+                set_peft_model_state_dict(unwrapped.llm, adapter_w)
+                accelerator.print(f"[Resume] LoRA 权重已恢复 ({safetensors_fp})")
+
+            start_epoch = ckpt_data['epoch'] + 1
+            best_bacc   = ckpt_data['val_bacc']
+            accelerator.print(
+                f"[Resume] ✅ 从 Epoch {start_epoch}/{num_epochs} 续训，"
+                f"当前最优 BAcc={best_bacc:.4f}\n"
+            )
+        else:
+            accelerator.print(f"[Resume] ⚠️  未找到 {best_ckpt_path}，从头开始训练\n")
+
+    remaining_epochs = num_epochs - start_epoch + 1
+    total_steps      = steps_per_epoch * remaining_epochs
+    warmup_steps     = int(total_steps * train_cfg.get('warmup_ratio', 0.1)) \
+                       if start_epoch == 1 else 0
 
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
@@ -405,15 +452,24 @@ def _run_training_loop(
     scheduler = accelerator.prepare(scheduler)
 
     # ---- 训练循环 ----
-    accelerator.print(f"\n[4/4] 开始训练（{num_epochs} epoch，grad_accum={grad_accum}）\n")
-    patience      = train_cfg.get('patience', 3)
-    best_bacc     = -1.0
-    no_improve    = 0
-    best_ckpt     = os.path.join(output_dir, 'best_model.pt')
-    history       = []
+    accelerator.print(
+        f"\n[4/4] 开始训练（Epoch {start_epoch}~{num_epochs}，"
+        f"共 {remaining_epochs} 轮，grad_accum={grad_accum}）\n"
+    )
+    patience  = train_cfg.get('patience', 3)
+    best_ckpt = os.path.join(output_dir, 'best_model.pt')
+    history   = []
 
     model.train()
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(start_epoch, num_epochs + 1):
+        accelerator.unwrap_model(model)._current_epoch = epoch
+        if accelerator.is_main_process:
+            unwrapped = accelerator.unwrap_model(model)
+            accelerator.print(
+                f"[Aux] Epoch {epoch}: mode={unwrapped.aux_loss_description()}, "
+                f"lambda={unwrapped._get_aux_lambda():.3f}"
+            )
+
         epoch_loss = 0.0
         epoch_lm_loss  = 0.0
         epoch_aux_loss = 0.0
@@ -485,7 +541,7 @@ def _run_training_loop(
                     'gmn':          unwrapped_model.gmn.state_dict(),
                     'projector':    unwrapped_model.projector.state_dict(),
                     'cross_attn':   unwrapped_model.cross_attn_layer.state_dict(),
-                    'gmn_cls_head': unwrapped_model.gmn_cls_head.state_dict(),
+                    'gmn_delta_cls_head': unwrapped_model.gmn_delta_cls_head.state_dict(),
                     'graph_global_proj': unwrapped_model.graph_global_proj.state_dict(),
                     'graph_global_norm': unwrapped_model.graph_global_norm.state_dict(),
                     'alpha_macro':       unwrapped_model.alpha_macro.data,

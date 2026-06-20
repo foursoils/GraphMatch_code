@@ -2,7 +2,7 @@
 graph_match_llm - 评估脚本
 ============================
 功能：
-  - 加载已训练的检查点（GNN + Projector + Cross-Attn）以及 LoRA adapter
+  - 加载已训练的检查点（GMN + Projector + Cross-Attn + gmn_delta_cls_head）以及 LoRA adapter
   - 在各数据集上批量推理，解析 Yes/No，计算 BAcc / F1 / AUC 等指标
   - 结果保存为 parquet（与其他对比实验格式一致）
 
@@ -16,7 +16,6 @@ graph_match_llm - 评估脚本
 import os
 import sys
 import re
-import json
 import argparse
 
 import torch
@@ -90,41 +89,63 @@ def parse_binary_pred(text: str) -> int:
     return -1
 
 
-# compute_metrics has been removed, using sklearn.metrics instead.
+def _is_main_process() -> bool:
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
+def _load_lora_adapter(model: LLMGraphModel, ckpt_path: str):
+    """
+    将 LoRA 权重写入已有 PeftModel。
+
+    model.llm 在 __init__ 中已通过 get_peft_model 包装，不能再 PeftModel.from_pretrained
+    套一层，否则 key 路径双重嵌套导致 LoRA 实际未生效。
+    """
+    lora_dir = os.path.join(os.path.dirname(ckpt_path), 'lora_adapter')
+    if not os.path.isdir(lora_dir):
+        if _is_main_process():
+            print(f"[Warn] 未找到 LoRA 目录: {lora_dir}")
+        return
+
+    safetensors_path = os.path.join(lora_dir, 'adapter_model.safetensors')
+    if not os.path.exists(safetensors_path):
+        if _is_main_process():
+            print(f"[Warn] 找不到 adapter_model.safetensors: {lora_dir}")
+        return
+
+    try:
+        from safetensors.torch import load_file
+        from peft import set_peft_model_state_dict
+
+        adapter_state = load_file(safetensors_path, device='cpu')
+        result = set_peft_model_state_dict(model.llm, adapter_state)
+        if _is_main_process():
+            print(f"[Ckpt] LoRA adapter 已加载: {lora_dir}")
+            if result.unexpected_keys:
+                print(f"[Warn] LoRA 意外 key 数量: {len(result.unexpected_keys)}")
+    except Exception as e:
+        if _is_main_process():
+            print(f"[Warn] LoRA adapter 加载失败: {e}")
 
 
 def load_checkpoint(model: LLMGraphModel, ckpt_path: str):
-    """加载 GNN / Projector / Cross-Attn 权重，以及 LoRA adapter（如有）。"""
+    """加载 GMN / Projector / Cross-Attn / gmn_delta_cls_head / 宏观注入层及 LoRA。"""
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     model.gmn.load_state_dict(ckpt['gmn'])
     model.projector.load_state_dict(ckpt['projector'])
     model.cross_attn_layer.load_state_dict(ckpt['cross_attn'])
-    if 'gmn_cls_head' in ckpt:
-        model.gmn_cls_head.load_state_dict(ckpt['gmn_cls_head'])
-    if 'graph_global_proj' in ckpt:
-        model.graph_global_proj.load_state_dict(ckpt['graph_global_proj'])
-    if 'graph_global_norm' in ckpt:
-        model.graph_global_norm.load_state_dict(ckpt['graph_global_norm'])
-    if 'alpha_macro' in ckpt:
-        model.alpha_macro.data.copy_(ckpt['alpha_macro'])
-    epoch = ckpt.get('epoch', '?')
-    bacc  = ckpt.get('val_bacc', '?')
-    
-    is_main = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    if is_main:
-        print(f"[Ckpt] 加载检查点 (Epoch={epoch}, val_BAcc={bacc})")
+    if 'gmn_delta_cls_head' in ckpt:
+        model.gmn_delta_cls_head.load_state_dict(ckpt['gmn_delta_cls_head'])
+    model.graph_global_proj.load_state_dict(ckpt['graph_global_proj'])
+    model.graph_global_norm.load_state_dict(ckpt['graph_global_norm'])
+    model.alpha_macro.data.copy_(ckpt['alpha_macro'])
 
-    # 尝试加载 LoRA adapter
-    lora_dir = os.path.join(os.path.dirname(ckpt_path), 'lora_adapter')
-    if os.path.isdir(lora_dir):
-        try:
-            from peft import PeftModel
-            model.llm = PeftModel.from_pretrained(model.llm, lora_dir)
-            if is_main:
-                print(f"[Ckpt] LoRA adapter 已加载: {lora_dir}")
-        except Exception as e:
-            if is_main:
-                print(f"[Warn] LoRA adapter 加载失败: {e}")
+    if _is_main_process():
+        print(
+            f"[Ckpt] 加载检查点 (Epoch={ckpt.get('epoch', '?')}, "
+            f"val_BAcc={ckpt.get('val_bacc', '?')})"
+        )
+
+    _load_lora_adapter(model, ckpt_path)
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +184,7 @@ def evaluate_dataset(
         shuffle=False,
         num_workers=num_workers,
         collate_fn=llm_graph_collate_fn,
+        pin_memory=torch.cuda.is_available(),
     )
 
     # Wrap model and loader
@@ -232,16 +254,21 @@ def evaluate_dataset(
         valid_p = [p for p in reconstructed_preds if p != -1]
         valid_l = [l for p, l in zip(reconstructed_preds, reconstructed_labels) if p != -1]
         
+        n_total = len(reconstructed_preds)
+        n_valid = len(valid_p)
+        parse_rate = n_valid / max(n_total, 1)
+
         acc = accuracy_score(valid_l, valid_p) if valid_p else 0.0
         bacc = balanced_accuracy_score(valid_l, valid_p) if valid_p else 0.0
         f1 = f1_score(valid_l, valid_p, average='binary', zero_division=0) if valid_p else 0.0
-        
+
         return {
             'Acc': acc,
             'BAcc': bacc,
             'F1': f1,
-            'n_samples': len(reconstructed_preds),
-            'valid_samples': len(valid_p),
+            'parse_rate': parse_rate,
+            'n_samples': n_total,
+            'valid_samples': n_valid,
         }
     else:
         return None
@@ -308,7 +335,10 @@ def main():
     if infer_workers != infer_cfg.get('num_workers', 2) and accelerator.is_main_process:
         print(f"[DataLoader] Windows 平台：num_workers 已自动设为 0（配置值 {infer_cfg.get('num_workers')} 被忽略）")
 
-    ckpt_path = args.ckpt or os.path.join(output_dir, 'best_model.pt')
+    if args.ckpt:
+        ckpt_path = args.ckpt if os.path.isabs(args.ckpt) else resolve(_PROJ_ROOT, args.ckpt)
+    else:
+        ckpt_path = os.path.join(output_dir, 'best_model.pt')
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"检查点不存在: {ckpt_path}")
 
@@ -361,8 +391,11 @@ def main():
         )
 
         if accelerator.is_main_process and metrics is not None:
-            print(f"  [Done] 处理完成。样本数: {metrics['n_samples']} | "
-                  f"Acc: {metrics['Acc']:.4f} | BAcc: {metrics['BAcc']:.4f} | F1: {metrics['F1']:.4f}")
+            print(
+                f"  [Done] 样本数: {metrics['n_samples']} | "
+                f"parse_rate: {metrics['parse_rate']:.2%} | "
+                f"Acc: {metrics['Acc']:.4f} | BAcc: {metrics['BAcc']:.4f} | F1: {metrics['F1']:.4f}"
+            )
             print(f"  结果已写出: {output_path}")
 
     if accelerator.is_main_process:

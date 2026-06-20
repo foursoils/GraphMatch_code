@@ -134,7 +134,14 @@ class LLMGraphModel(nn.Module):
         self.max_new_tokens   = model_cfg.get('max_new_tokens',   512)
         self.inject_layer     = model_cfg.get('inject_layer',     16)
         self.cross_attn_heads = model_cfg.get('cross_attn_heads', 8)
-        self._aux_lambda      = train_cfg.get('aux_lambda',       0.3)
+        self._aux_lambda_max           = train_cfg.get('aux_lambda', 0.8)
+        self._aux_lambda_start         = train_cfg.get('aux_lambda_start', 0.3)
+        self._aux_lambda_warmup_epochs = train_cfg.get('aux_lambda_warmup_epochs', 3)
+        self._aux_warmup_epochs        = train_cfg.get('aux_warmup_epochs', 3)
+        self._aux_cosine_target        = train_cfg.get('aux_cosine_target', 0.5)
+        # aux_mode: 'cosine_only' 全程软化 cosine；'two_phase' 预热后切换 delta CE
+        self._aux_mode                 = train_cfg.get('aux_mode', 'cosine_only')
+        self._current_epoch            = 1
 
         # ---- 解析 LLM 路径 ----
         llm_path = model_cfg['llm_model_path']
@@ -223,13 +230,13 @@ class LLMGraphModel(nn.Module):
         # ---- Projector ----
         self.projector = GraphProjector(gnn_cfg['hidden_dim'], llm_dim).to(_dev)
 
-        # ---- GMN 辅助分类头（直接监督 [g_c; g_d; g_c-g_d]，给 GMN 强梯度信号）----
+        # ---- GMN 辅助头：two_phase 模式下预热结束后监督 delta_h_g ----
         gmn_dim = gnn_cfg['hidden_dim']
-        self.gmn_cls_head = nn.Sequential(
-            nn.Linear(gmn_dim * 3, gmn_dim),
+        self.gmn_delta_cls_head = nn.Sequential(
+            nn.Linear(gmn_dim, gmn_dim // 2),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(gmn_dim, 2),
+            nn.Linear(gmn_dim // 2, 2),
         ).to(_dev)
 
         # ---- Cross-Attention 注入层 ----
@@ -371,6 +378,57 @@ class LLMGraphModel(nn.Module):
         return padded, g_c, g_d  # [B,N_max,llm_dim], [B,gmn_dim], [B,gmn_dim]
 
     # -----------------------------------------------------------------------
+    # GMN 辅助 loss
+    # -----------------------------------------------------------------------
+
+    def _get_aux_lambda(self) -> float:
+        """aux_lambda 线性 warmup：前 aux_lambda_warmup_epochs 轮从 start 爬升到 max。"""
+        epoch = getattr(self, '_current_epoch', 1)
+        start, max_l, warmup_ep = (
+            self._aux_lambda_start,
+            self._aux_lambda_max,
+            self._aux_lambda_warmup_epochs,
+        )
+        if warmup_ep <= 0:
+            return max_l
+        progress = min(1.0, (epoch - 1) / warmup_ep)
+        return start + (max_l - start) * progress
+
+    def _compute_aux_loss(
+        self,
+        g_c: torch.Tensor,
+        g_d: torch.Tensor,
+        delta_h_g: torch.Tensor,
+        label_tensor: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        GMN 辅助监督：
+          cosine_only / 预热阶段: 软化 cosine MSE（冷启动梯度稳定）
+          two_phase 后续阶段: delta_h_g + CE（与宏观注入向量对齐）
+        """
+        epoch = getattr(self, '_current_epoch', 1)
+
+        if self._aux_mode == 'cosine_only' or epoch <= self._aux_warmup_epochs:
+            cos_sim = torch.nn.functional.cosine_similarity(
+                g_c.to(device), g_d.to(device), dim=-1
+            )
+            scale  = self._aux_cosine_target
+            target = (2.0 * label_tensor.float().to(device) - 1.0) * scale
+            return torch.nn.functional.mse_loss(cos_sim, target)
+
+        logits = self.gmn_delta_cls_head(delta_h_g)
+        return torch.nn.functional.cross_entropy(logits, label_tensor)
+
+    def aux_loss_description(self) -> str:
+        if self._aux_mode == 'cosine_only':
+            return f'cosine_only(±{self._aux_cosine_target})'
+        epoch = getattr(self, '_current_epoch', 1)
+        if epoch <= self._aux_warmup_epochs:
+            return f'cosine(±{self._aux_cosine_target})'
+        return 'delta_ce'
+
+    # -----------------------------------------------------------------------
     # 辅助：Qwen chat template
     # -----------------------------------------------------------------------
 
@@ -472,17 +530,18 @@ class LLMGraphModel(nn.Module):
         self._graph_kv = None
         self.current_delta_h_g = None
 
-        # 6. 辅助分类 loss（[g_c; g_d; g_c-g_d] → 直接预测 label）
+        # 6. GMN 辅助 loss
         lm_loss  = outputs.loss
         aux_loss = torch.tensor(0.0, device=lm_loss.device)
         if 'label' in batch and g_c is not None:
             label_tensor = torch.tensor(batch['label'], dtype=torch.long,
                                         device=g_c.device)
-            graph_cls_feat = torch.cat([g_c, g_d, g_c - g_d], dim=-1).to(lm_loss.device)
-            logits   = self.gmn_cls_head(graph_cls_feat)
-            aux_loss = nn.functional.cross_entropy(logits, label_tensor)
+            delta_h_g = (g_c - g_d).to(lm_loss.device)
+            aux_loss = self._compute_aux_loss(
+                g_c, g_d, delta_h_g, label_tensor, lm_loss.device
+            )
 
-        aux_lambda = getattr(self, '_aux_lambda', 0.3)
+        aux_lambda = self._get_aux_lambda()
         return lm_loss + aux_lambda * aux_loss, lm_loss.detach(), aux_loss.detach()
 
     # -----------------------------------------------------------------------

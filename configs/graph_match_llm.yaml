@@ -74,7 +74,13 @@ llm_graph:
     # 双学习率：LoRA + Cross-Attn/GNN 分开（4B LoRA 常用 1e-5~2e-5）
     lora_lr: 1.0e-5
     graph_lr: 2.0e-5 # GMN + Projector + Cross-Attn 模块
-    aux_lambda: 0.3 # 辅助分类 loss 权重（GMN 分类头，给 GMN 强梯度信号）
+    # GMN 辅助 loss：全程 cosine_only 推荐；two_phase 会在预热后切换 delta CE
+    aux_lambda: 0.5              # aux 权重上限
+    aux_lambda_start: 0.2        # aux 权重起始值
+    aux_lambda_warmup_epochs: 2  # aux 权重线性爬升轮数
+    aux_warmup_epochs: 2          # cosine 预热轮数（two_phase 模式下生效）
+    aux_cosine_target: 0.3        # 软化 cosine 目标幅度（±scale）
+    aux_mode: cosine_only          # cosine_only | two_phase
     weight_decay: 0.05
     warmup_ratio: 0.1
     patience: 3 # Early Stopping
