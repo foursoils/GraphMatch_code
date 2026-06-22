@@ -33,6 +33,7 @@ import sys
 import contextlib
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.utils import scatter
 from torch_geometric.nn import global_mean_pool
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -123,7 +124,7 @@ class LLMGraphModel(nn.Module):
     推理：inference(batch) → {'id', 'pred', 'label'}
     """
 
-    def __init__(self, config: dict, device: torch.device = None):
+    def __init__(self, config: dict, device: torch.device = None, apply_lora: bool = True):
         super().__init__()
         model_cfg  = config['model']
         gnn_cfg    = config.get('gmn', config.get('gnn', {}))  # 兼容两种 key
@@ -134,14 +135,15 @@ class LLMGraphModel(nn.Module):
         self.max_new_tokens   = model_cfg.get('max_new_tokens',   512)
         self.inject_layer     = model_cfg.get('inject_layer',     16)
         self.cross_attn_heads = model_cfg.get('cross_attn_heads', 8)
-        self._aux_lambda_max           = train_cfg.get('aux_lambda', 0.8)
-        self._aux_lambda_start         = train_cfg.get('aux_lambda_start', 0.3)
-        self._aux_lambda_warmup_epochs = train_cfg.get('aux_lambda_warmup_epochs', 3)
-        self._aux_warmup_epochs        = train_cfg.get('aux_warmup_epochs', 3)
-        self._aux_cosine_target        = train_cfg.get('aux_cosine_target', 0.5)
-        # aux_mode: 'cosine_only' 全程软化 cosine；'two_phase' 预热后切换 delta CE
-        self._aux_mode                 = train_cfg.get('aux_mode', 'cosine_only')
-        self._current_epoch            = 1
+
+        # Plan-D / Plan-D-v2 辅助 loss 配置
+        self.aux_mode                   = train_cfg.get('aux_mode', 'cosine_only')
+        self.aux_lambda_max             = train_cfg.get('aux_lambda', 0.5)
+        self.aux_lambda_start           = train_cfg.get('aux_lambda_start', 0.2)
+        self.aux_lambda_warmup_epochs   = train_cfg.get('aux_lambda_warmup_epochs', 2)
+        self.aux_warmup_epochs          = train_cfg.get('aux_warmup_epochs', 2)
+        self.aux_cosine_target          = train_cfg.get('aux_cosine_target', 0.3)
+        self._current_epoch             = 1
 
         # ---- 解析 LLM 路径 ----
         llm_path = model_cfg['llm_model_path']
@@ -192,7 +194,8 @@ class LLMGraphModel(nn.Module):
         self.num_layers = num_layers
 
         # ---- LoRA ----
-        if _PEFT_AVAILABLE:
+        # 推理时 apply_lora=False，由 evaluate.load_checkpoint 从 adapter 目录加载
+        if _PEFT_AVAILABLE and apply_lora:
             layers_to_transform = list(range(self.inject_layer, num_layers))
             lora_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
@@ -206,6 +209,8 @@ class LLMGraphModel(nn.Module):
             llm = get_peft_model(llm, lora_config)
             print(f"[Init] LoRA 已应用 (仅作用于 Layer {self.inject_layer} 至 {num_layers-1})。")
             llm.print_trainable_parameters()
+        elif not apply_lora:
+            print("[Init] 推理模式：跳过 LoRA 初始化，等待 load_checkpoint 加载 adapter。")
         else:
             # 没有 peft 时全量微调（仅调试用）
             print("[Init] 无 LoRA，LLM 全量可训练（仅调试）。")
@@ -230,14 +235,19 @@ class LLMGraphModel(nn.Module):
         # ---- Projector ----
         self.projector = GraphProjector(gnn_cfg['hidden_dim'], llm_dim).to(_dev)
 
-        # ---- GMN 辅助头：two_phase 模式下预热结束后监督 delta_h_g ----
         gmn_dim = gnn_cfg['hidden_dim']
-        self.gmn_delta_cls_head = nn.Sequential(
-            nn.Linear(gmn_dim, gmn_dim // 2),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(gmn_dim // 2, 2),
-        ).to(_dev)
+        # two_phase 模式下 epoch 预热后切换 delta CE；cosine_only 全程不用
+        self.gmn_delta_cls_head = None
+        if self.aux_mode == 'two_phase':
+            self.gmn_delta_cls_head = nn.Sequential(
+                nn.Linear(gmn_dim, gmn_dim),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(gmn_dim, 2),
+            ).to(_dev)
+
+        # 兼容旧检查点加载（Plan-B），推理不使用
+        self.gmn_cls_head = None
 
         # ---- Cross-Attention 注入层 ----
         self.cross_attn_layer = GraphCrossAttnLayer(
@@ -278,7 +288,45 @@ class LLMGraphModel(nn.Module):
                 "whether the document supports the claim."
             )
 
-        print(f"[Init] 完成。LLM_dim={llm_dim}, 注入层={self.inject_layer}")
+        print(f"[Init] 完成。LLM_dim={llm_dim}, 注入层={self.inject_layer}, aux_mode={self.aux_mode}")
+
+    # -----------------------------------------------------------------------
+    # Plan-D / Plan-D-v2 辅助 loss
+    # -----------------------------------------------------------------------
+
+    def aux_phase_name(self) -> str:
+        """返回当前 epoch 的 aux 阶段：cosine 或 delta_ce。"""
+        if self.aux_mode == 'cosine_only':
+            return 'cosine'
+        if self._current_epoch <= self.aux_warmup_epochs:
+            return 'cosine'
+        return 'delta_ce'
+
+    def _get_aux_lambda(self) -> float:
+        """aux 权重：从 aux_lambda_start 线性爬升至 aux_lambda_max。"""
+        warmup = max(int(self.aux_lambda_warmup_epochs), 1)
+        if self._current_epoch >= warmup:
+            return float(self.aux_lambda_max)
+        t = (self._current_epoch - 1) / warmup
+        return float(self.aux_lambda_start + (self.aux_lambda_max - self.aux_lambda_start) * t)
+
+    def _compute_aux_loss(self, g_c: torch.Tensor, g_d: torch.Tensor, labels: list) -> torch.Tensor:
+        """
+        Plan-D-v2 cosine_only：全程软化 cosine，目标 ±aux_cosine_target。
+        two_phase：前 aux_warmup_epochs 轮 cosine，之后切换 delta CE。
+        """
+        device = g_c.device
+        label_tensor = torch.tensor(labels, dtype=torch.long, device=device)
+        phase = self.aux_phase_name()
+
+        if phase == 'cosine':
+            sim = F.cosine_similarity(g_c.float(), g_d.float(), dim=-1)
+            signed_target = (2.0 * label_tensor.float() - 1.0) * self.aux_cosine_target
+            return F.mse_loss(sim, signed_target)
+
+        delta = (g_c - g_d).to(device)
+        logits = self.gmn_delta_cls_head(delta)
+        return F.cross_entropy(logits, label_tensor)
 
     # -----------------------------------------------------------------------
     # Hook 注入机制
@@ -376,57 +424,6 @@ class LLMGraphModel(nn.Module):
             padded[i, :s.size(0)] = s
 
         return padded, g_c, g_d  # [B,N_max,llm_dim], [B,gmn_dim], [B,gmn_dim]
-
-    # -----------------------------------------------------------------------
-    # GMN 辅助 loss
-    # -----------------------------------------------------------------------
-
-    def _get_aux_lambda(self) -> float:
-        """aux_lambda 线性 warmup：前 aux_lambda_warmup_epochs 轮从 start 爬升到 max。"""
-        epoch = getattr(self, '_current_epoch', 1)
-        start, max_l, warmup_ep = (
-            self._aux_lambda_start,
-            self._aux_lambda_max,
-            self._aux_lambda_warmup_epochs,
-        )
-        if warmup_ep <= 0:
-            return max_l
-        progress = min(1.0, (epoch - 1) / warmup_ep)
-        return start + (max_l - start) * progress
-
-    def _compute_aux_loss(
-        self,
-        g_c: torch.Tensor,
-        g_d: torch.Tensor,
-        delta_h_g: torch.Tensor,
-        label_tensor: torch.Tensor,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        GMN 辅助监督：
-          cosine_only / 预热阶段: 软化 cosine MSE（冷启动梯度稳定）
-          two_phase 后续阶段: delta_h_g + CE（与宏观注入向量对齐）
-        """
-        epoch = getattr(self, '_current_epoch', 1)
-
-        if self._aux_mode == 'cosine_only' or epoch <= self._aux_warmup_epochs:
-            cos_sim = torch.nn.functional.cosine_similarity(
-                g_c.to(device), g_d.to(device), dim=-1
-            )
-            scale  = self._aux_cosine_target
-            target = (2.0 * label_tensor.float().to(device) - 1.0) * scale
-            return torch.nn.functional.mse_loss(cos_sim, target)
-
-        logits = self.gmn_delta_cls_head(delta_h_g)
-        return torch.nn.functional.cross_entropy(logits, label_tensor)
-
-    def aux_loss_description(self) -> str:
-        if self._aux_mode == 'cosine_only':
-            return f'cosine_only(±{self._aux_cosine_target})'
-        epoch = getattr(self, '_current_epoch', 1)
-        if epoch <= self._aux_warmup_epochs:
-            return f'cosine(±{self._aux_cosine_target})'
-        return 'delta_ce'
 
     # -----------------------------------------------------------------------
     # 辅助：Qwen chat template
@@ -530,16 +527,11 @@ class LLMGraphModel(nn.Module):
         self._graph_kv = None
         self.current_delta_h_g = None
 
-        # 6. GMN 辅助 loss
+        # 6. Plan-D 辅助 loss（cosine_only 或 two_phase）
         lm_loss  = outputs.loss
         aux_loss = torch.tensor(0.0, device=lm_loss.device)
         if 'label' in batch and g_c is not None:
-            label_tensor = torch.tensor(batch['label'], dtype=torch.long,
-                                        device=g_c.device)
-            delta_h_g = (g_c - g_d).to(lm_loss.device)
-            aux_loss = self._compute_aux_loss(
-                g_c, g_d, delta_h_g, label_tensor, lm_loss.device
-            )
+            aux_loss = self._compute_aux_loss(g_c, g_d, batch['label'])
 
         aux_lambda = self._get_aux_lambda()
         return lm_loss + aux_lambda * aux_loss, lm_loss.detach(), aux_loss.detach()
