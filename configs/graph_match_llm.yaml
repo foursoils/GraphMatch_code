@@ -1,57 +1,42 @@
 llm_graph:
 
   data:
-    # 训练集：普通 data_with_graph parquet（无需 CoT）
     train_file: "../data/minicheck/data_with_graph/gemma_26b_tk/train.parquet"
-    # 训练集预计算 Embedding（ID 与 train_file 一一对应）
     train_embed_file: "../data/embeddings/Qwen3-Embedding-0.6B/minicheck/gemma_26b_tk/train.pt"
-    # 验证集：带图字段 of parquet（不需要 CoT，用来算 BAcc）
     val_file: "../data/minicheck/data_with_graph/gemma_26b_tk/val.parquet"
-    # 验证集预计算 Embedding
     val_embed_file: "../data/embeddings/Qwen3-Embedding-0.6B/minicheck/gemma_26b_tk/val.pt"
-    # 推理评估的数据根目录
     data_root: "../data"
-    # 推理结果输出文件名
     output_filename: "qwen3_4b_instruct_2507.parquet"
-    # 需要推理的数据集
     datasets:
       - AggreFact-CNN
       - AggreFact-XSum
       - COVID-Fact
       - ExpertQA
-      - Reveal
+      # - Reveal
       - SCIFACT
       - pubhealth
       - summeval
+      - minicheck
 
   model:
-    # 学生 LLM 路径（HuggingFace: Qwen/Qwen3-4B-Instruct-2507）
     llm_model_path: "../models/llms/Qwen3-4B-Instruct-2507"
-    # 系统提示词
     system_prompt_path: "../prompts/hallu_detect/system_prompt.txt"
-    # 节点/边 Embedding 模型
     embed_model_path: "../models/embeddings/Qwen3-Embedding-0.6B"
-    # 图信息注入层（Qwen3-4B 共 36 层、hidden=2560，取中间层 18）
     inject_layer: 18
-    # Cross-Attention 头数（2560 / 8 = 320，需整除 llm hidden_size）
     cross_attn_heads: 8
-    # 文本最大 token 数（instruction 部分；2507 原生 256K，训练保持 1024 即可）
     max_txt_len: 1024
-    # answer_only 只需 1 个字符，留 4 token 余量
-    max_new_tokens: 4
+    max_new_tokens: 6
 
   gmn:
-    # GMN（Graph Matching Network）：claim 图和 doc 图跨图互相感知对齐
-    in_dim: 1024 # Qwen3-Embedding-0.6B 的输出维度（节点/边 embedding 维度）
-    hidden_dim: 1024 # GMN 内部隐层维度（与 nli_graph 保持一致）
-    num_layers: 3 # GMNPropLayer 传播层数
+    in_dim: 1024
+    hidden_dim: 728
+    num_layers: 3
     dropout: 0.3
 
   lora:
-    r: 16
-    lora_alpha: 32
-    lora_dropout: 0.05
-    # 注入 LoRA 的目标模块（包含自注意力投影与 FFN 全连接，以适配 train.md 方案）
+    r: 8
+    lora_alpha: 16
+    lora_dropout: 0.15
     target_modules:
       - "q_proj"
       - "k_proj"
@@ -62,37 +47,32 @@ llm_graph:
       - "down_proj"
 
   training:
-    gpu_ids: "0,1"
-    # 混合精度，可选 "bf16", "fp16", "no"
+    gpu_ids: "0,1,2,3"
     mixed_precision: "bf16"
     seed: 42
-    num_epochs: 20
-    batch_size: 2          # 每卡 batch；2×A5000(24G) 可跑 2
-    eval_batch_size: 24
-    grad_accum_steps: 4    # 全局等效 batch = 2卡×2×4 = 16
-    num_workers: 4 # Linux 有效；Windows 下代码会自动降为 0
-    # 双学习率：LoRA + Cross-Attn/GNN 分开（4B LoRA 常用 1e-5~2e-5）
-    lora_lr: 1.0e-5
-    graph_lr: 2.0e-5 # GMN + Projector + Cross-Attn 模块
-    # GMN 辅助 loss：全程 cosine_only 推荐；two_phase 会在预热后切换 delta CE
-    aux_lambda: 0.5              # aux 权重上限
-    aux_lambda_start: 0.2        # aux 权重起始值
-    aux_lambda_warmup_epochs: 2  # aux 权重线性爬升轮数
-    aux_warmup_epochs: 2          # cosine 预热轮数（two_phase 模式下生效）
-    aux_cosine_target: 0.3        # 软化 cosine 目标幅度（±scale）
-    aux_mode: cosine_only          # cosine_only | two_phase
-    weight_decay: 0.05
+    num_epochs: 7
+    batch_size: 2
+    eval_batch_size: 26
+    grad_accum_steps: 2
+    num_workers: 2
+    lora_lr: 5.0e-6
+    graph_lr: 5.0e-5
+    aux_lambda: 0.5
+    aux_lambda_start: 0.2
+    aux_lambda_warmup_epochs: 2
+    aux_mode: "cosine_only"
+    aux_cosine_target: 0.3
+    weight_decay: 0.1
     warmup_ratio: 0.1
-    patience: 3 # Early Stopping
+    patience: 3
     output_dir: "../models/llm_graph"
     log_dir: "../log/llm_graph"
-    # 验证集评估采样开关及样本量（训练时提速）
     val_sample: false
     val_sample_size: 300
     train_target: "answer_only"
 
   infer:
     gpu_ids: "0,1"
-    batch_size: 8          # 每卡 batch；2×A5000 推理
-    num_workers: 4 # Linux 有效；Windows 下代码会自动降为 0
-    test_limit: 0 # 0=全量，>0=调试截断
+    batch_size: 16
+    num_workers: 16
+    test_limit: 0

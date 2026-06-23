@@ -28,3 +28,18 @@ def resolve_num_workers(configured: int) -> int:
     if sys.platform == 'win32':
         return 0
     return configured
+
+
+def is_rank0() -> bool:
+    """单卡或分布式 rank 0 时返回 True，用于抑制多卡重复日志。"""
+    if "LOCAL_RANK" in os.environ:
+        return int(os.environ["LOCAL_RANK"]) == 0
+    if "RANK" in os.environ:
+        return int(os.environ["RANK"]) == 0
+    return True
+
+
+def log_rank0(*args, **kwargs):
+    """仅在 rank 0 进程打印。"""
+    if is_rank0():
+        print(*args, **kwargs)

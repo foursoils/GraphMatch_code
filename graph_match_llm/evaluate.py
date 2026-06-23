@@ -18,6 +18,7 @@ import sys
 import re
 import json
 import argparse
+import logging
 
 import torch
 import yaml
@@ -31,7 +32,7 @@ sys.path.insert(0, _PROJ_ROOT)
 
 from graph_match_llm.dataset import LLMGraphDataset, llm_graph_collate_fn
 from graph_match_llm.model   import LLMGraphModel
-from utils.path_utils        import resolve_num_workers
+from utils.path_utils        import resolve_num_workers, log_rank0, is_rank0
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +144,9 @@ def load_checkpoint(model: LLMGraphModel, ckpt_path: str):
     epoch = ckpt.get('epoch', '?')
     bacc  = ckpt.get('val_bacc', '?')
     
-    is_main = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    is_main = is_rank0()
     if is_main:
-        print(f"[Ckpt] 加载检查点 (Epoch={epoch}, val_BAcc={bacc})")
+        log_rank0(f"[Ckpt] 加载检查点 (Epoch={epoch}, val_BAcc={bacc})")
 
     # 从 adapter 目录加载 LoRA（基座 LLM 上一次性挂载，避免双重 Peft 包装）
     lora_dir = os.path.join(os.path.dirname(ckpt_path), 'lora_adapter')
@@ -162,12 +163,12 @@ def load_checkpoint(model: LLMGraphModel, ckpt_path: str):
             if is_main:
                 ok = _verify_lora_loaded(model, lora_dir)
                 status = "权重校验通过" if ok else "权重校验失败"
-                print(f"[Ckpt] LoRA adapter 已加载: {lora_dir} ({status})")
+                log_rank0(f"[Ckpt] LoRA adapter 已加载: {lora_dir} ({status})")
                 if not ok:
-                    print("[Warn] LoRA 权重可能未正确写入，请检查 adapter 路径与配置。")
+                    log_rank0("[Warn] LoRA 权重可能未正确写入，请检查 adapter 路径与配置。")
         except Exception as e:
             if is_main:
-                print(f"[Warn] LoRA adapter 加载失败: {e}")
+                log_rank0(f"[Warn] LoRA adapter 加载失败: {e}")
             raise
 
 
@@ -347,6 +348,10 @@ def main():
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+
+    if not accelerator.is_main_process:
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        logging.getLogger("accelerate").setLevel(logging.ERROR)
 
     infer_workers = resolve_num_workers(infer_cfg.get('num_workers', 2))
     if infer_workers != infer_cfg.get('num_workers', 2) and accelerator.is_main_process:

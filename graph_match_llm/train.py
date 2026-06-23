@@ -13,6 +13,7 @@ import sys
 import json
 import re
 import argparse
+import logging
 import random
 from datetime import datetime
 import numpy as np
@@ -31,7 +32,7 @@ sys.path.insert(0, _PROJ_ROOT)
 
 from graph_match_llm.dataset import LLMGraphDataset, llm_graph_collate_fn
 from graph_match_llm.model   import LLMGraphModel
-from utils.path_utils        import resolve_num_workers
+from utils.path_utils        import resolve_num_workers, log_rank0, is_rank0
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +97,13 @@ def teardown_train_log(log_file, orig_stdout):
     if log_file is not None:
         sys.stdout = orig_stdout
         log_file.close()
+
+
+def _suppress_non_main_logs():
+    """非 rank 0 进程压低第三方库日志，避免多卡重复输出。"""
+    if not is_rank0():
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        logging.getLogger("accelerate").setLevel(logging.ERROR)
 
 
 def parse_binary_pred(text: str) -> int:
@@ -297,11 +305,12 @@ def _run_training_loop(
     val_embed_file,
     grad_accum,
 ):
+    _suppress_non_main_logs()
+
     # ---- 模型初始化 ----
     accelerator.print("\n[1/4] 初始化模型...")
     model = LLMGraphModel(config, device=accelerator.device)
-    if accelerator.is_main_process:
-        model.print_trainable_params()
+    model.print_trainable_params()
 
     device = accelerator.device
     tokenizer = model.tokenizer

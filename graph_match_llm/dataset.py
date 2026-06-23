@@ -27,6 +27,7 @@ sys.path.insert(0, _PROJ_ROOT)
 # 导入公共数据处理工具
 # ---------------------------------------------------------------------------
 from utils.dataset_utils import PairData, textualize_graph, build_pair_data, load_precomputed_embeddings
+from utils.path_utils import log_rank0
 
 
 
@@ -72,7 +73,7 @@ class LLMGraphDataset(Dataset):
         self.tokenizer    = tokenizer
         self.device       = device
 
-        print(f"[Dataset] 加载数据: {parquet_path}")
+        log_rank0(f"[Dataset] 加载数据: {parquet_path}")
         self.df = pd.read_parquet(parquet_path).reset_index(drop=True)
 
         # 加载提示词

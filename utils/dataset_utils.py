@@ -4,6 +4,8 @@ import torch
 import pandas as pd
 from torch_geometric.data import Data
 
+from utils.path_utils import log_rank0
+
 # ---------------------------------------------------------------------------
 # PairData：GMN 需要的 claim/doc 配对图格式，统一支持 NLI 模型的 token keys 批处理
 # ---------------------------------------------------------------------------
@@ -114,13 +116,13 @@ def load_precomputed_embeddings(parquet_path: str, embed_model_path: str, embed_
     use_precomputed = False
     if embeddings_path and os.path.exists(embeddings_path):
         try:
-            print(f"[Dataset] 使用预计算 Embedding: {embeddings_path}")
+            log_rank0(f"[Dataset] 使用预计算 Embedding: {embeddings_path}")
             embeddings_dict = torch.load(
                 embeddings_path, map_location='cpu', weights_only=False
             )
             use_precomputed = True
         except Exception as e:
-            print(f"[Dataset] 读取预计算 Embedding 失败，改为在线计算: {e}")
+            log_rank0(f"[Dataset] 读取预计算 Embedding 失败，改为在线计算: {e}")
             
     return embeddings_dict, use_precomputed, embeddings_path
 

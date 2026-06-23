@@ -38,15 +38,17 @@ from torch_geometric.utils import scatter
 from torch_geometric.nn import global_mean_pool
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+_PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PROJ_ROOT)
+
+from utils.path_utils import log_rank0
+
 try:
     from peft import get_peft_model, LoraConfig, TaskType
     _PEFT_AVAILABLE = True
 except ImportError:
     _PEFT_AVAILABLE = False
-    print("[Warning] peft 未安装，将不使用 LoRA（全量微调 LLM，显存压力大）。")
-
-_PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _PROJ_ROOT)
+    log_rank0("[Warning] peft 未安装，将不使用 LoRA（全量微调 LLM，显存压力大）。")
 
 from utils.gmn import GMNEncoder
 
@@ -176,7 +178,7 @@ class LLMGraphModel(nn.Module):
                 device_map = 'auto'
                 _dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        print(f"[Init] 加载 LLM: {llm_path} (device_map={device_map})")
+        log_rank0(f"[Init] 加载 LLM: {llm_path} (device_map={device_map})")
         llm = AutoModelForCausalLM.from_pretrained(
             llm_path,
             torch_dtype=torch.bfloat16,
@@ -207,13 +209,12 @@ class LLMGraphModel(nn.Module):
                 layers_to_transform=layers_to_transform,
             )
             llm = get_peft_model(llm, lora_config)
-            print(f"[Init] LoRA 已应用 (仅作用于 Layer {self.inject_layer} 至 {num_layers-1})。")
-            llm.print_trainable_parameters()
+            log_rank0(f"[Init] LoRA 已应用 (仅作用于 Layer {self.inject_layer} 至 {num_layers-1})。")
         elif not apply_lora:
-            print("[Init] 推理模式：跳过 LoRA 初始化，等待 load_checkpoint 加载 adapter。")
+            log_rank0("[Init] 推理模式：跳过 LoRA 初始化，等待 load_checkpoint 加载 adapter。")
         else:
             # 没有 peft 时全量微调（仅调试用）
-            print("[Init] 无 LoRA，LLM 全量可训练（仅调试）。")
+            log_rank0("[Init] 无 LoRA，LLM 全量可训练（仅调试）。")
 
         self.llm = llm
 
@@ -280,7 +281,7 @@ class LLMGraphModel(nn.Module):
         if os.path.exists(sys_path):
             with open(sys_path, 'r', encoding='utf-8') as f:
                 self.system_prompt = f.read().strip()
-            print(f"[Init] 从 {sys_path} 加载系统提示词。")
+            log_rank0(f"[Init] 从 {sys_path} 加载系统提示词。")
         else:
             self.system_prompt = (
                 "You are an expert fact-checker. "
@@ -288,7 +289,7 @@ class LLMGraphModel(nn.Module):
                 "whether the document supports the claim."
             )
 
-        print(f"[Init] 完成。LLM_dim={llm_dim}, 注入层={self.inject_layer}, aux_mode={self.aux_mode}")
+        log_rank0(f"[Init] 完成。LLM_dim={llm_dim}, 注入层={self.inject_layer}, aux_mode={self.aux_mode}")
 
     # -----------------------------------------------------------------------
     # Plan-D / Plan-D-v2 辅助 loss
@@ -376,7 +377,7 @@ class LLMGraphModel(nn.Module):
             return injected
 
         self._hook_handle = layers[k].register_forward_hook(_hook)
-        print(f"[Init] Cross-Attention hook 已注册到 Layer {k}。")
+        log_rank0(f"[Init] Cross-Attention hook 已注册到 Layer {k}。")
 
     # -----------------------------------------------------------------------
     # 图编码
@@ -597,7 +598,7 @@ class LLMGraphModel(nn.Module):
             if p.requires_grad:
                 trainable += n
         pct = 100 * trainable / total if total > 0 else 0
-        print(f"可训练参数: {trainable:,} / 全部参数: {total:,} ({pct:.2f}%)")
+        log_rank0(f"可训练参数: {trainable:,} / 全部参数: {total:,} ({pct:.2f}%)")
         return trainable, total
 
     def remove_hook(self):
