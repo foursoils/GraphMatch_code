@@ -61,6 +61,11 @@ def configure_dist_process_logging():
     except ImportError:
         pass
     try:
+        from transformers.utils.logging import disable_progress_bar
+        disable_progress_bar()
+    except ImportError:
+        pass
+    try:
         from transformers.utils import logging as tf_logging
         tf_logging.set_verbosity_error()
     except ImportError:

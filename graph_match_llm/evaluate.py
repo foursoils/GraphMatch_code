@@ -64,6 +64,7 @@ def _maybe_relaunch_multigpu():
         f"--num_processes={len(gpus)}",
         f"--num_machines=1",
         f"--mixed_precision={mixed_precision}",
+        "--dynamo_backend=no",
         sys.argv[0],
     ] + sys.argv[1:]
     result = subprocess.run(cmd)
