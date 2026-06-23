@@ -15,10 +15,65 @@ graph_match_llm - 评估脚本
 
 import os
 import sys
+import argparse
+import subprocess
+import warnings
+
+warnings.filterwarnings("ignore", message="An issue occurred while importing 'torch-scatter'")
+warnings.filterwarnings("ignore", message="An issue occurred while importing 'torch-sparse'")
+
+_PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PROJ_ROOT)
+
+
+def _maybe_relaunch_multigpu():
+    """多卡时在导入 torch / 模型之前拉起 accelerate。"""
+    if __name__ != '__main__':
+        return
+    if any(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE")):
+        return
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default='configs/graph_match_llm.yaml')
+    args = parser.parse_args()
+
+    import yaml
+
+    config_path = os.path.join(_PROJ_ROOT, args.config) if not os.path.isabs(args.config) \
+                  else args.config
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)['llm_graph']
+    infer_cfg = config['infer']
+    train_cfg = config['training']
+
+    gpu_ids = infer_cfg.get('gpu_ids', None)
+    if gpu_ids is None or gpu_ids == "":
+        return
+
+    gpus = [x.strip() for x in str(gpu_ids).split(',') if x.strip()]
+    if len(gpus) <= 1:
+        return
+
+    print(f"\n[Self-Launcher] 检测到多卡配置 (gpu_ids: {gpu_ids})，正在自动通过 `accelerate launch` 启动多卡评估...")
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids)
+    mixed_precision = train_cfg.get('mixed_precision', 'bf16')
+    cmd = [
+        sys.executable,
+        "-m",
+        "accelerate.commands.launch",
+        f"--num_processes={len(gpus)}",
+        f"--num_machines=1",
+        f"--mixed_precision={mixed_precision}",
+        sys.argv[0],
+    ] + sys.argv[1:]
+    result = subprocess.run(cmd)
+    sys.exit(result.returncode)
+
+
+_maybe_relaunch_multigpu()
+
 import re
 import json
-import argparse
-import logging
 
 import torch
 import yaml
@@ -26,13 +81,15 @@ import pandas as pd
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
-_PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _PROJ_ROOT)
+from utils.path_utils import resolve_num_workers, log_rank0, is_rank0, configure_dist_process_logging
+
+configure_dist_process_logging()
 
 from graph_match_llm.dataset import LLMGraphDataset, llm_graph_collate_fn
 from graph_match_llm.model   import LLMGraphModel
-from utils.path_utils        import resolve_num_workers, log_rank0, is_rank0
 
 
 # ---------------------------------------------------------------------------
@@ -316,42 +373,15 @@ def main():
     data_root   = resolve(_PROJ_ROOT, data_cfg['data_root'])
     out_fname   = data_cfg.get('output_filename', 'llm_graph_pred.parquet')
     test_limit  = infer_cfg.get('test_limit', 0)
-
-    # ---- GPU 与环境变量配置 ----
     gpu_ids = infer_cfg.get('gpu_ids', None)
+
     if gpu_ids is not None and gpu_ids != "":
-        gpus = [x.strip() for x in str(gpu_ids).split(',') if x.strip()]
-        num_gpus = len(gpus)
-        if num_gpus > 1:
-            # 检查当前是否已经在分布式环境中运行（避免无限循环拉起）
-            is_distributed = any(k in os.environ for k in ["RANK", "LOCAL_RANK", "WORLD_SIZE"])
-            if not is_distributed:
-                print(f"\n[Self-Launcher] 检测到多卡配置 (gpu_ids: {gpu_ids})，正在自动通过 `accelerate launch` 启动多卡评估...")
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids)
-                
-                import subprocess
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "accelerate.commands.launch",
-                    f"--num_processes={num_gpus}",
-                    sys.argv[0]
-                ] + sys.argv[1:]
-                
-                result = subprocess.run(cmd)
-                sys.exit(result.returncode)
-        
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids)
 
-    from accelerate import Accelerator
-    from accelerate.utils import DistributedDataParallelKwargs
+    configure_dist_process_logging()
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
-
-    if not accelerator.is_main_process:
-        logging.getLogger("transformers").setLevel(logging.ERROR)
-        logging.getLogger("accelerate").setLevel(logging.ERROR)
 
     infer_workers = resolve_num_workers(infer_cfg.get('num_workers', 2))
     if infer_workers != infer_cfg.get('num_workers', 2) and accelerator.is_main_process:

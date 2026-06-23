@@ -41,7 +41,22 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PROJ_ROOT)
 
-from utils.path_utils import log_rank0
+from utils.path_utils import log_rank0, is_rank0, configure_dist_process_logging
+
+
+@contextlib.contextmanager
+def _quiet_load_if_not_rank0():
+    """非 rank 0 加载权重时禁用 transformers 的 Loading weights 进度条。"""
+    if is_rank0():
+        yield
+        return
+    import tqdm.std
+    orig = tqdm.std.tqdm
+    tqdm.std.tqdm = lambda *a, **kw: orig(*a, **{**kw, 'disable': True})
+    try:
+        yield
+    finally:
+        tqdm.std.tqdm = orig
 
 try:
     from peft import get_peft_model, LoraConfig, TaskType
@@ -179,12 +194,14 @@ class LLMGraphModel(nn.Module):
                 _dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         log_rank0(f"[Init] 加载 LLM: {llm_path} (device_map={device_map})")
-        llm = AutoModelForCausalLM.from_pretrained(
-            llm_path,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            device_map=device_map,
-        )
+        configure_dist_process_logging()
+        with _quiet_load_if_not_rank0():
+            llm = AutoModelForCausalLM.from_pretrained(
+                llm_path,
+                dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+                device_map=device_map,
+            )
 
         # LLM hidden size & layers/heads info
         base_cfg   = getattr(llm, 'config', None) or getattr(llm.base_model, 'config', None)

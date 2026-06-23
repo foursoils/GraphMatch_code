@@ -43,3 +43,25 @@ def log_rank0(*args, **kwargs):
     """仅在 rank 0 进程打印。"""
     if is_rank0():
         print(*args, **kwargs)
+
+
+def configure_dist_process_logging():
+    """非 rank 0 进程压低第三方库日志与进度条（需在 LOCAL_RANK 就绪后调用）。"""
+    if is_rank0():
+        return
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("TQDM_DISABLE", "1")
+    import logging
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    logging.getLogger("accelerate").setLevel(logging.ERROR)
+    try:
+        from huggingface_hub.utils import disable_progress_bars
+        disable_progress_bars()
+    except ImportError:
+        pass
+    try:
+        from transformers.utils import logging as tf_logging
+        tf_logging.set_verbosity_error()
+    except ImportError:
+        pass

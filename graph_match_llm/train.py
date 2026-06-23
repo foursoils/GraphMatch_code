@@ -10,10 +10,64 @@ graph_match_llm - 训练脚本
 
 import os
 import sys
+import argparse
+import subprocess
+import warnings
+
+warnings.filterwarnings("ignore", message="An issue occurred while importing 'torch-scatter'")
+warnings.filterwarnings("ignore", message="An issue occurred while importing 'torch-sparse'")
+
+_PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PROJ_ROOT)
+
+
+def _maybe_relaunch_multigpu():
+    """多卡时在导入 torch / 模型之前拉起 accelerate，避免父进程重复加载与重复日志。"""
+    if __name__ != '__main__':
+        return
+    if any(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE")):
+        return
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default='configs/graph_match_llm.yaml')
+    args = parser.parse_args()
+
+    import yaml
+
+    config_path = os.path.join(_PROJ_ROOT, args.config) if not os.path.isabs(args.config) \
+                  else args.config
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)['llm_graph']
+    train_cfg = config['training']
+
+    gpu_ids = train_cfg.get('gpu_ids', None)
+    if gpu_ids is None or gpu_ids == "":
+        return
+
+    gpus = [x.strip() for x in str(gpu_ids).split(',') if x.strip()]
+    if len(gpus) <= 1:
+        return
+
+    print(f"\n[Self-Launcher] 检测到多卡配置 (gpu_ids: {gpu_ids})，正在自动通过 `accelerate launch` 启动多卡训练...")
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids)
+    mixed_precision = train_cfg.get('mixed_precision', 'bf16')
+    cmd = [
+        sys.executable,
+        "-m",
+        "accelerate.commands.launch",
+        f"--num_processes={len(gpus)}",
+        f"--num_machines=1",
+        f"--mixed_precision={mixed_precision}",
+        sys.argv[0],
+    ] + sys.argv[1:]
+    result = subprocess.run(cmd)
+    sys.exit(result.returncode)
+
+
+_maybe_relaunch_multigpu()
+
 import json
 import re
-import argparse
-import logging
 import random
 from datetime import datetime
 import numpy as np
@@ -27,12 +81,12 @@ from transformers import get_cosine_schedule_with_warmup
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
-_PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _PROJ_ROOT)
+from utils.path_utils import resolve_num_workers, log_rank0, configure_dist_process_logging
+
+configure_dist_process_logging()
 
 from graph_match_llm.dataset import LLMGraphDataset, llm_graph_collate_fn
 from graph_match_llm.model   import LLMGraphModel
-from utils.path_utils        import resolve_num_workers, log_rank0, is_rank0
 
 
 # ---------------------------------------------------------------------------
@@ -97,13 +151,6 @@ def teardown_train_log(log_file, orig_stdout):
     if log_file is not None:
         sys.stdout = orig_stdout
         log_file.close()
-
-
-def _suppress_non_main_logs():
-    """非 rank 0 进程压低第三方库日志，避免多卡重复输出。"""
-    if not is_rank0():
-        logging.getLogger("transformers").setLevel(logging.ERROR)
-        logging.getLogger("accelerate").setLevel(logging.ERROR)
 
 
 def parse_binary_pred(text: str) -> int:
@@ -210,33 +257,9 @@ def train():
     model_cfg = config['model']
     train_cfg = config['training']
 
-    # ---- GPU 与环境变量配置 ----
+    # ---- GPU 可见设备 ----
     gpu_ids = train_cfg.get('gpu_ids', None)
     if gpu_ids is not None and gpu_ids != "":
-        gpus = [x.strip() for x in str(gpu_ids).split(',') if x.strip()]
-        num_gpus = len(gpus)
-        if num_gpus > 1:
-            # 检查当前是否已经在分布式环境中运行（避免无限循环拉起）
-            is_distributed = any(k in os.environ for k in ["RANK", "LOCAL_RANK", "WORLD_SIZE"])
-            if not is_distributed:
-                print(f"\n[Self-Launcher] 检测到多卡配置 (gpu_ids: {gpu_ids})，正在自动通过 `accelerate launch` 启动多卡训练...")
-                # 先设置 CUDA_VISIBLE_DEVICES，让子进程继承它
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids)
-                
-                import subprocess
-                # 构造启动命令，使用当前 Python 解释器和脚本路径
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "accelerate.commands.launch",
-                    f"--num_processes={num_gpus}",
-                    sys.argv[0]
-                ] + sys.argv[1:]
-                
-                # 运行子进程并同步退出状态
-                result = subprocess.run(cmd)
-                sys.exit(result.returncode)
-        
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids)
 
     seed_everything(train_cfg.get('seed', 42))
@@ -257,8 +280,8 @@ def train():
     # 限制只有主进程创建文件夹
     grad_accum      = train_cfg.get('grad_accum_steps', 16)
     mixed_precision = train_cfg.get('mixed_precision', 'bf16')
-    # find_unused_parameters=True：LoRA hook 方式注入导致部分参数不直接参与 loss，DDP 需要此选项
-    ddp_kwargs  = DistributedDataParallelKwargs(find_unused_parameters=True)
+    # find_unused_parameters=False：前向无 unused 参数时避免 DDP 每步额外遍历与重复告警
+    ddp_kwargs  = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(
         gradient_accumulation_steps=grad_accum,
         mixed_precision=mixed_precision,
@@ -305,7 +328,7 @@ def _run_training_loop(
     val_embed_file,
     grad_accum,
 ):
-    _suppress_non_main_logs()
+    configure_dist_process_logging()
 
     # ---- 模型初始化 ----
     accelerator.print("\n[1/4] 初始化模型...")
